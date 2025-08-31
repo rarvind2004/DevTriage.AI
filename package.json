@@ -1,0 +1,8 @@
+{
+  "name": "devtriage",
+  "private": true,
+  "workspaces": ["packages/*"],
+  "scripts": {
+    "dev:all": "docker compose up --build"
+  }
+}
