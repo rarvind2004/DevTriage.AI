@@ -1,7 +1,5 @@
 # DevTriage AI • MVP with Agentic Architecture
 
-*Status: ready to clone and run locally. This doc contains a full repo layout, core code for each service, and deploy steps.*
-
 ---
 
 ## What changed vs original spec
