@@ -22,7 +22,7 @@ langgraph dev
 
 The server starts on [http://127.0.0.1:2024](http://127.0.0.1:2024) and exposes the `devtriage` graph. You can also open LangGraph Studio UI (URL printed in terminal) to chat.
 
-3. Talk to the agent via SDK:
+3. Talk to the agent via SDK with response in console (note, everything here can also be completed through LanGraph Studio):
 
 ```bash
 python test.py

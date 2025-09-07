@@ -1,4 +1,3 @@
-# app/graph.py
 from typing import Sequence
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
@@ -25,7 +24,7 @@ prompt = ChatPromptTemplate.from_messages(
 # --- Tools ---
 tools: Sequence = [parse_logs, generate_test_logs, score_report]
 
-# --- Agent (ReAct) ---
+# --- Agent ---
 graph = create_react_agent(
     model=model,
     tools=tools,
