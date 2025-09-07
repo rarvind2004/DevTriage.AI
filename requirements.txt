@@ -1,0 +1,14 @@
+# Core graph + CLI (dev server)
+langgraph>=0.2.36
+langgraph-cli[inmem]>=0.3.8
+langgraph-sdk>=0.1.42
+
+# LangChain core + Google Gemini integration
+langchain>=0.2.17
+langchain-core>=0.2.38
+langchain-google-genai>=2.1.10
+
+# Utilities
+pydantic>=2.7.0
+python-dotenv>=1.0.1
+regex>=2024.5.15
