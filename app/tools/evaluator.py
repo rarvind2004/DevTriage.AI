@@ -1,199 +1,206 @@
 import json
-import re
-from typing import Any, Dict, Optional
+from typing import Dict, List, Literal, Optional, Union
+from pydantic import BaseModel, Field
 from langchain_core.tools import tool
+from langchain_google_genai import ChatGoogleGenerativeAI
 
-# Optional tolerant JSON parser (handles single quotes, trailing commas, etc.)
-try:  # pragma: no cover
-    import json5 as _json5  # type: ignore
-except Exception:  # pragma: no cover
-    _json5 = None
+# -----------------------------
+# Pydantic Schemas
+# -----------------------------
 
-# ------------------------
-# Robust JSON coercion utils
-# ------------------------
+class NormalizedReport(BaseModel):
+    summary: str
+    severity: Literal["critical", "high", "medium", "low"]
+    suspected_causes: List[str]
+    evidence: List[str]
+    impacted_components: List[str]
+    repro_steps: List[str]
+    experiments: List[str]
+    next_actions: List[str]
+    owner_suggestions: List[str]
+    notes: Optional[str] = None
 
-def _strip_code_fences(s: str) -> str:
-    if not isinstance(s, str):
-        return s
-    s = s.strip()
-    # Remove leading/trailing markdown code fences like ```json ... ```
-    s = re.sub(r"^```[a-zA-Z0-9_-]*", "", s)
-    s = re.sub(r"```$", "", s)
-    return s.strip()
+class CriterionGrade(BaseModel):
+    name: Literal["relevance", "clarity", "completeness", "accuracy", "actionability"]
+    score: int = Field(ge=1, le=5)
+    rationale: str
 
+class GradeResult(BaseModel):
+    ok: bool
+    overall_score: int = Field(description="Sum of criterion scores (max 25)")
+    grade: Literal["A", "B", "C", "D", "F"]
+    decision: Literal["pass", "needs_improvement"]
+    criteria: List[CriterionGrade]
+    groundedness: Literal["high", "medium", "low"]
+    extracted_facts: List[str] = []
+    missing_elements: List[str] = []
+    normalized_report: Optional[NormalizedReport] = None
+    notes: Optional[str] = None
 
-def _first_balanced_json_object(s: str) -> Optional[str]:
-    """Extract the first balanced {...} block. Fallback for LLM text with pre/post amble."""
-    start = s.find("{")
-    if start == -1:
-        return None
-    depth = 0
-    in_str = False
-    esc = False
-    for i in range(start, len(s)):
-        ch = s[i]
-        if in_str:
-            if esc:
-                esc = False
-            elif ch == "\\":
-                esc = True
-            elif ch == '"':
-                in_str = False
-            continue
-        else:
-            if ch == '"':
-                in_str = True
-                continue
-            if ch == '{':
-                depth += 1
-            elif ch == '}':
-                depth -= 1
-                if depth == 0:
-                    return s[start : i + 1]
-    return None
+# -----------------------------
+# Helpers
+# -----------------------------
 
+def _get_model() -> ChatGoogleGenerativeAI:
+    # Uses GOOGLE_API_KEY from environment
+    return ChatGoogleGenerativeAI(model="gemini-2.0-flash", temperature=0.2)
 
-def _json_loads_tolerant(s: str) -> Optional[Dict[str, Any]]:
+def _safe_json_loads(maybe_json: str) -> Optional[dict]:
     try:
-        return json.loads(s)
+        return json.loads(maybe_json)
     except Exception:
-        pass
-    if _json5 is not None:
+        return None
+
+def _normalize_report_via_ai(report_input: Union[str, dict]) -> NormalizedReport:
+    """Robustly coerce an arbitrary report (dict or text) into NormalizedReport using the LLM.
+    Falls back to a best-effort minimal structure if the model is unavailable.
+    """
+    if isinstance(report_input, dict):
+        # Try direct model validation first
         try:
-            result = _json5.loads(s)
-            if isinstance(result, dict):
-                return result
+            return NormalizedReport(**report_input)
         except Exception:
             pass
-    return None
 
+    # If it's a string, try JSON first
+    if isinstance(report_input, str):
+        obj = _safe_json_loads(report_input)
+        if obj is not None:
+            try:
+                return NormalizedReport(**obj)
+            except Exception:
+                # will attempt AI normalization below
+                pass
+        raw_text = report_input
+    else:
+        raw_text = json.dumps(report_input)
 
-def _coerce_to_dict(obj: Any, label: str) -> Dict[str, Any]:
-    """
-    Best-effort conversion of many response shapes into a dict.
-    Accepts dicts, Pydantic BaseModel, LangChain messages, or JSON-ish strings (even with code fences).
-    Returns {ok: bool, value?: dict, error?: str, preview?: str}
-    """
-    # Native dict
-    if isinstance(obj, dict):
-        return {"ok": True, "value": obj}
-
-    # Pydantic models
+    # AI normalization to schema
     try:
-        if hasattr(obj, "model_dump"):
-            return {"ok": True, "value": obj.model_dump()}  # type: ignore[attr-defined]
+        model = _get_model().with_structured_output(NormalizedReport)
+        prompt = (
+            "Normalize the following debugging report to the schema. "
+            "Extract concrete content. If a field is missing, infer conservatively from context.\n\n"
+            f"REPORT:\n{raw_text}"
+        )
+        raw_result = model.invoke(prompt)
+        if isinstance(raw_result, NormalizedReport):
+            return raw_result
+        elif isinstance(raw_result, dict):
+            return NormalizedReport(**raw_result)
+        elif isinstance(raw_result, BaseModel):
+            return NormalizedReport(**raw_result.model_dump())
+        else:
+            raise ValueError("Unexpected result type from model.invoke")
     except Exception:
-        pass
+        # Minimal fallback to keep tool resilient
+        return NormalizedReport(
+            summary="Unparsed report; minimal fallback.",
+            severity="medium",
+            suspected_causes=[],
+            evidence=[],
+            impacted_components=[],
+            repro_steps=[],
+            experiments=[],
+            next_actions=[],
+            owner_suggestions=[],
+            notes=None,
+        )
+
+def _ai_grade(report: NormalizedReport, log_text: Optional[str], ground_truth: Optional[dict], rubric: Optional[str]) -> GradeResult:
+    rubric_text = rubric or (
+        "Grade the response against these criteria (1-5 each):\n"
+        "- relevance: Does it directly address the provided logs and user ask?\n"
+        "- clarity: Is it easy to follow with specific references?\n"
+        "- completeness: Does it cover root cause, evidence, and next steps?\n"
+        "- accuracy: Are claims consistent with the log evidence and any ground truth?\n"
+        "- actionability: Are next actions prioritized and concrete?\n"
+        "Return a balanced assessment; avoid inflating scores."
+    )
+
+    # Build grading context
+    gt_str = json.dumps(ground_truth) if ground_truth else "{}"
+
     try:
-        if hasattr(obj, "dict"):
-            return {"ok": True, "value": obj.dict()}  # type: ignore[attr-defined]
-    except Exception:
-        pass
-
-    # LangChain/AI message-like objects
-    if hasattr(obj, "content") and isinstance(getattr(obj, "content"), str):
-        obj = getattr(obj, "content")
-
-    # Must be a string by now (best-effort)
-    if not isinstance(obj, str):
-        obj = str(obj)
-
-    s = _strip_code_fences(obj)
-
-    # Try direct parse
-    parsed = _json_loads_tolerant(s)
-    if parsed is not None:
-        return {"ok": True, "value": parsed}
-
-    # Try to extract first {...} block
-    cand = _first_balanced_json_object(s)
-    if cand:
-        parsed = _json_loads_tolerant(cand)
-        if parsed is not None:
-            return {"ok": True, "value": parsed}
-
-    # Nothing worked
-    return {
-        "ok": False,
-        "error": f"Could not coerce {label} to JSON dict.",
-        "preview": s[:500],
-    }
-
+        model = _get_model().with_structured_output(GradeResult)
+        prompt = (
+            "You are an evaluation subagent. Read LOGS and a candidate RESPONSE. "
+            "Use the RUBRIC to grade. Cite concrete evidence from the logs when judging accuracy.\n\n"
+            f"RUBRIC:\n{rubric_text}\n\n"
+            f"LOGS:\n{(log_text or '<<no logs provided>>')}\n\n"
+            f"GROUND_TRUTH (optional):\n{gt_str}\n\n"
+            f"RESPONSE (normalized JSON):\n{report.model_dump_json() }\n\n"
+            "Output a GradeResult JSON."
+        )
+        raw_result = model.invoke(prompt)
+        if isinstance(raw_result, GradeResult):
+            graded = raw_result
+        elif isinstance(raw_result, dict):
+            graded = GradeResult(**raw_result)
+        elif isinstance(raw_result, BaseModel):
+            graded = GradeResult(**raw_result.model_dump())
+        else:
+            raise ValueError("Unexpected result type from model.invoke")
+        # Attach the normalized report for traceability
+        graded.normalized_report = report
+        return graded
+    except Exception as e:
+        # Fallback lightweight heuristic if the LLM call fails
+        summary = f"{report.summary} {' '.join(report.suspected_causes)}".lower()
+        # very simple scores
+        rel = 3 if summary else 1
+        cla = 3 if len(report.next_actions) or len(report.evidence) else 2
+        com = 3 if all([report.repro_steps, report.next_actions]) else 2
+        acc = 3
+        act = 3 if report.next_actions else 2
+        total = rel + cla + com + acc + act
+        grade = "A" if total >= 23 else "B" if total >= 19 else "C" if total >= 15 else "D" if total >= 12 else "F"
+        decision = "pass" if total >= 18 else "needs_improvement"
+        return GradeResult(
+            ok=False,
+            overall_score=total,
+            grade=grade,
+            decision=decision,
+            criteria=[
+                CriterionGrade(name="relevance", score=rel, rationale="Fallback heuristic"),
+                CriterionGrade(name="clarity", score=cla, rationale="Fallback heuristic"),
+                CriterionGrade(name="completeness", score=com, rationale="Fallback heuristic"),
+                CriterionGrade(name="accuracy", score=acc, rationale="Fallback heuristic"),
+                CriterionGrade(name="actionability", score=act, rationale="Fallback heuristic"),
+            ],
+            groundedness="medium",
+            extracted_facts=[],
+            missing_elements=[],
+            normalized_report=report,
+            notes=f"LLM grading unavailable: {type(e).__name__}",
+        )
 
 @tool("score_report", return_direct=False)
-def score_report(report_json: Any, ground_truth_json: Optional[Any] = None) -> Dict:
+def score_report(
+    report_input: Union[str, dict],
+    log_text: Optional[str] = None,
+    ground_truth_json: Optional[str] = None,
+    rubric: Optional[str] = None,
+) -> Dict:
     """
-    Robust scorer for a LogDiagnosisReport-like payload.
+    AI-driven evaluator for a LogDiagnosisReport. Accepts either a raw text or JSON report.
 
-    Input can be a dict, a Pydantic model, a LangChain message, or a JSON string
-    (even if wrapped in markdown fences or containing extra text). The function
-    normalizes inputs and returns a simple accuracy dict useful for synthetic evals.
+    Args:
+        report_input: The candidate report (string JSON, dict, or free text). The function will normalize it.
+        log_text: Optional raw logs used to produce the report; improves accuracy grading.
+        ground_truth_json: Optional JSON string with keys like {"root_cause": str, "tags": [..]} from synthetic generator.
+        rubric: Optional custom rubric text to override the default criteria.
 
     Returns:
-        {
-          ok: bool,
-          score: int,                # higher is better
-          checks: list,              # which checks passed
-          normalized_report: dict,   # the parsed report (when ok)
-          normalized_truth: dict|None
-        }
+        dict: GradeResult serialized to dict, including the normalized report.
     """
-    rep = _coerce_to_dict(report_json, "report_json")
-    if not rep["ok"]:
-        return {"ok": False, "error": rep.get("error"), "preview": rep.get("preview")}
+    # Parse ground truth if present
+    gt = _safe_json_loads(ground_truth_json) if ground_truth_json else None
 
-    gt_dict = None
-    if ground_truth_json is not None:
-        gt = _coerce_to_dict(ground_truth_json, "ground_truth_json")
-        if gt["ok"]:
-            gt_dict = gt["value"]
-        else:
-            # Non-fatal; we still score what we can
-            gt_dict = None
+    # Normalize the report to a stable schema using the AI subagent
+    normalized = _normalize_report_via_ai(report_input)
 
-    report = rep["value"]
+    # Grade with the AI subagent (falls back to heuristic on failure)
+    result = _ai_grade(normalized, log_text=log_text, ground_truth=gt, rubric=rubric)
 
-    # Pull common fields defensively
-    summary = str(report.get("summary") or "").strip()
-    suspected_causes = report.get("suspected_causes") or []
-    if not isinstance(suspected_causes, list):
-        suspected_causes = [str(suspected_causes)]
-
-    next_actions = report.get("next_actions") or []
-    if not isinstance(next_actions, list):
-        next_actions = [str(next_actions)]
-
-    haystack = (summary + " " + " ".join(map(str, suspected_causes))).lower()
-
-    score = 0
-    checks = []
-
-    # 1) Root cause mentioned
-    if gt_dict and gt_dict.get("root_cause"):
-        root = str(gt_dict["root_cause"]).lower()
-        # token-overlap heuristic
-        root_tokens = [t for t in re.split(r"[^a-z0-9_]+", root) if t]
-        rc_hit = any(t in haystack for t in root_tokens)
-        score += 1 if rc_hit else 0
-        checks.append({"check": "root_cause_mentioned", "pass": rc_hit, "tokens": root_tokens[:6]})
-
-    # 2) Tag overlap
-    if gt_dict and isinstance(gt_dict.get("tags"), list):
-        tags = [str(t).lower() for t in gt_dict["tags"]]
-        tag_hits = sum(1 for t in tags if t in haystack)
-        score += min(tag_hits, 3)  # cap to avoid runaway scores
-        checks.append({"check": "tag_overlap", "hits": tag_hits, "tags": tags[:6]})
-
-    # 3) Has next actions
-    has_actions = any(str(a).strip() for a in next_actions)
-    score += 1 if has_actions else 0
-    checks.append({"check": "has_next_actions", "pass": has_actions})
-
-    return {
-        "ok": True,
-        "score": score,
-        "checks": checks,
-        "normalized_report": report,
-        "normalized_truth": gt_dict,
-    }
+    return result.model_dump()

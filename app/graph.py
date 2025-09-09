@@ -4,7 +4,7 @@ from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langgraph.prebuilt import create_react_agent
 
 from app.schemas.schemas import LogDiagnosisReport
-from app.prompts.system_prompt import SYSTEM_PROMPT
+from app.prompts.system_prompt import get_root_prompt
 from app.tools import parse_logs, generate_test_logs, score_report
 
 # --- Model: Gemini 2.0 Flash ---
@@ -16,7 +16,7 @@ model = ChatGoogleGenerativeAI(
 # --- Prompt (use a real MessagesPlaceholder) ---
 prompt = ChatPromptTemplate.from_messages(
     [
-        ("system", SYSTEM_PROMPT),
+        ("system", get_root_prompt()),
         MessagesPlaceholder("messages"),
     ]
 )
